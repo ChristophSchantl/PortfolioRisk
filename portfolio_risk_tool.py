@@ -1,5 +1,6 @@
 # portfolio_risk_tool.py
 # Streamlit-Tool für Portfolio-Bewertung & Sortino-Optimierung
+# - verwendet ausschließlich den Close-Preis
 # - min. Gewicht je Aktie: 5% (falls machbar)
 # - Beta/Alpha vs S&P500 (^GSPC) und DAX (^GDAXI)
 # - Kennzahlen für Equal-Weight- und Optimized-Portfolio
@@ -83,7 +84,7 @@ optimize_objective = st.sidebar.selectbox(
 # ─────────────────────────────────────────────
 def load_prices(tickers, start, end):
     """
-    Robustes Laden: pro Ticker, nutzt Adj Close oder Close.
+    Robustes Laden: pro Ticker, verwendet ausschließlich 'Close'.
     Gibt prices, OK-Ticker, fehlende Ticker zurück.
     """
     series_list = []
@@ -107,20 +108,17 @@ def load_prices(tickers, start, end):
             missing.append(t)
             continue
 
-        col = None
-        if "Adj Close" in data.columns:
-            col = "Adj Close"
-        elif "Close" in data.columns:
-            col = "Close"
-        else:
+        # NUR Close verwenden
+        if "Close" not in data.columns:
             missing.append(t)
             continue
 
-        s = data[col].rename(t).dropna()
+        s = data["Close"].copy().dropna()
         if s.empty:
             missing.append(t)
             continue
 
+        s.name = t  # Name setzen statt rename()
         series_list.append(s)
         ok.append(t)
 
@@ -132,6 +130,9 @@ def load_prices(tickers, start, end):
 
 
 def load_benchmark_series(ticker, start, end):
+    """
+    Benchmark-Serie laden, ausschließlich 'Close' verwenden.
+    """
     try:
         data = yf.download(
             ticker,
@@ -143,11 +144,10 @@ def load_benchmark_series(ticker, start, end):
     except Exception:
         return None
 
-    if data is None or data.empty:
+    if data is None or data.empty or "Close" not in data.columns:
         return None
 
-    col = "Adj Close" if "Adj Close" in data.columns else "Close"
-    s = data[col].dropna()
+    s = data["Close"].dropna()
     if s.empty:
         return None
     return s
@@ -338,7 +338,7 @@ def optimize_weights(returns_df,
         return w0
 
     w_opt = res.x
-    # kleine numerische Negativwerte bereinigen
+    # numerische Artefakte bereinigen
     w_opt[w_opt < 0] = 0.0
     s = w_opt.sum()
     if s != 0:
@@ -374,7 +374,7 @@ if missing_tickers:
 
 returns = prices.pct_change().dropna()
 
-# Benchmarks
+# Benchmarks (Close)
 bench_spx = load_benchmark_series(benchmark_ticker_spx, start_date, end_date)
 bench_dax = load_benchmark_series(benchmark_ticker_dax, start_date, end_date)
 
