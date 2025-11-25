@@ -358,7 +358,7 @@ st.dataframe(display_df, use_container_width=True)
 st.subheader("Rendite vs. Volatilität (Einzeltitel)")
 
 # deutlich kleinere Figure
-fig_scatter, ax_scatter = plt.subplots(figsize=(3.5, 3.0))  # Breite, Höhe in Inch
+fig_scatter, ax_scatter = plt.subplots(figsize=(3.5, 2.0))  # Breite, Höhe in Inch
 
 for ticker in asset_df.index:
     ret = asset_df.loc[ticker, "Ann. Return"]
