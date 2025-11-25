@@ -369,16 +369,16 @@ for ticker in asset_df.index:
         (ret, vol),
         textcoords="offset points",
         xytext=(3, 2),
-        fontsize=4   # kleinere Schrift
+        fontsize=5   # kleinere Schrift
     )
 
 # vertikale Nulllinie für Rendite
 ax_scatter.axvline(0, linestyle="--", linewidth=0.6)
 
-ax_scatter.set_xlabel("Ann. Rendite", fontsize=8)
-ax_scatter.set_ylabel("Ann. Volatilität", fontsize=8)
+ax_scatter.set_xlabel("Ann. Rendite", fontsize=6)
+ax_scatter.set_ylabel("Ann. Volatilität", fontsize=6)
 
-ax_scatter.tick_params(axis="both", labelsize=7)
+ax_scatter.tick_params(axis="both", labelsize=6)
 
 fig_scatter.tight_layout(pad=0.5)
 
