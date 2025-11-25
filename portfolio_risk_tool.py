@@ -358,18 +358,18 @@ st.dataframe(display_df, use_container_width=True)
 st.subheader("Rendite vs. Volatilität (Einzeltitel)")
 
 # deutlich kleinere Figure
-fig_scatter, ax_scatter = plt.subplots(figsize=(3.5, 2.0))  # Breite, Höhe in Inch
+fig_scatter, ax_scatter = plt.subplots(figsize=(3.5, 2.5))  # Breite, Höhe in Inch
 
 for ticker in asset_df.index:
     ret = asset_df.loc[ticker, "Ann. Return"]
     vol = asset_df.loc[ticker, "Ann. Vol"]
-    ax_scatter.scatter(ret, vol, s=8)  # s = Markergröße
+    ax_scatter.scatter(ret, vol, s=6)  # s = Markergröße
     ax_scatter.annotate(
         ticker,
         (ret, vol),
         textcoords="offset points",
         xytext=(3, 2),
-        fontsize=6   # kleinere Schrift
+        fontsize=4   # kleinere Schrift
     )
 
 # vertikale Nulllinie für Rendite
