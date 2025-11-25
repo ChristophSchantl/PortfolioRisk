@@ -354,20 +354,33 @@ for c in ["Sharpe", "Sortino", "Beta_SPX", "Beta_DAX"]:
 st.subheader("Einzelwert-Kennzahlen")
 st.dataframe(display_df, use_container_width=True)
 
-# Scatter: Rendite vs. Volatilität
+# Scatter: Rendite vs. Volatilität (Einzeltitel) – kleinere Grafik, Achsen vertauscht
 st.subheader("Rendite vs. Volatilität (Einzeltitel)")
 
-fig_scatter, ax_scatter = plt.subplots()
-for ticker in asset_df.index:
-    vol = asset_df.loc[ticker, "Ann. Vol"]
-    ret = asset_df.loc[ticker, "Ann. Return"]
-    ax_scatter.scatter(vol, ret)
-    ax_scatter.annotate(ticker, (vol, ret), textcoords="offset points", xytext=(5, 3), fontsize=8)
+# kleinere Figure
+fig_scatter, ax_scatter = plt.subplots(figsize=(4, 3))
 
-ax_scatter.axhline(0, linestyle="--", linewidth=0.8)
-ax_scatter.set_xlabel("Ann. Volatilität")
-ax_scatter.set_ylabel("Ann. Rendite")
+for ticker in asset_df.index:
+    ret = asset_df.loc[ticker, "Ann. Return"]
+    vol = asset_df.loc[ticker, "Ann. Vol"]
+    # x = Rendite, y = Volatilität
+    ax_scatter.scatter(ret, vol)
+    ax_scatter.annotate(
+        ticker,
+        (ret, vol),
+        textcoords="offset points",
+        xytext=(5, 3),
+        fontsize=8
+    )
+
+# vertikale Nulllinie für Rendite
+ax_scatter.axvline(0, linestyle="--", linewidth=0.8)
+
+ax_scatter.set_xlabel("Ann. Rendite")
+ax_scatter.set_ylabel("Ann. Volatilität")
+
 st.pyplot(fig_scatter)
+
 
 # ─────────────────────────────────────────────
 # Manuelle Gewichte – Basisportfolio
