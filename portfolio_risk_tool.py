@@ -336,22 +336,31 @@ def risk_contributions(returns_df, weights, freq=TRADING_DAYS):
 def monthly_return_matrix(port_ret):
     """
     Monatsreturns (resample) und Matrix Year x Month.
+    Korrigierte Version: (1 + r) wird nur EINMAL verwendet.
     """
     if not isinstance(port_ret.index, pd.DatetimeIndex):
         return None, None
-    monthly = (1 + port_ret).resample('M').apply(lambda x: (1 + x).prod() - 1)
+
+    # Korrektur: (1 + port_ret) resamplen und die Produkte bilden
+    monthly = (1 + port_ret).resample('M').prod() - 1
+
     if monthly.empty:
         return None, None
+
     df = monthly.to_frame(name="Return")
     df["Year"] = df.index.year
     df["Month"] = df.index.strftime("%b")
+
     pivot = df.pivot(index="Year", columns="Month", values="Return")
-    # Monate sortieren
+
+    # Monate sauber sortieren
     month_order = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
                    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
     cols = [m for m in month_order if m in pivot.columns]
     pivot = pivot[cols]
+
     return pivot, monthly
+
 
 
 def portfolio_stats(returns_df, weights,
