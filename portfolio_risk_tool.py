@@ -87,9 +87,9 @@ def load_prices(tickers, start, end):
     )
     # yfinance liefert bei mehreren Tickers MultiIndex
     if isinstance(data.columns, pd.MultiIndex):
-        prices = data["Adj Close"].copy()
+        prices = data["Close"].copy()
     else:
-        prices = data["Adj Close"].to_frame()
+        prices = data["Close"].to_frame()
     prices = prices.dropna(how="all")
     return prices
 
@@ -301,7 +301,7 @@ try:
         end=end_date,
         auto_adjust=True,
         progress=False
-    )["Adj Close"].dropna()
+    )["Close"].dropna()
     bench_returns = bench_prices.pct_change().dropna()
 except Exception:
     st.warning("Benchmark-Daten konnten nicht geladen werden.")
