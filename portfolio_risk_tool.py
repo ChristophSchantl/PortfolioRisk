@@ -1,11 +1,28 @@
-# portfolio_risk_tool_manual.py
-# Streamlit-Tool für Portfolio-Bewertung & manuelle Gewichtung
-# - Close-Prices
-# - Lookback in Monaten (bis 36)
-# - Manuelle Gewichte (Standard: Equal Weight)
-# - Scatter: Rendite vs. Volatilität je Aktie
-# - Szenario: zusätzliche Aktien (Before/After-Strukturvergleich)
-# - Download der Ticker als CSV (EU-Format)
+# portfolio_risk_tool_institutional.py
+# Streamlit-Tool für Portfolio-Bewertung & Risikoanalyse mit manuellen Gewichten
+# Fokus: institutionelle Kennzahlen und Präsentation
+#
+# Features:
+# - Close-Prices via yfinance
+# - Lookback in Monaten (1–36)
+# - Manuelle Gewichte (Standard = Equal Weight) für Basis-Portfolio
+# - Optionales After-Portfolio mit zusätzlichen Aktien
+# - Kennzahlen: Return, Vol, Sharpe, Sortino, MaxDD, Hit Ratio
+#   + Beta/Alpha vs. S&P500 & DAX
+#   + Tracking Error & Information Ratio
+#   + Upside/Downside Capture
+#   + Skew, Kurtosis, Tail Ratio
+#   + VaR/ES (95/99)
+#   + Drawdown-Statistiken
+# - Grafiken:
+#   - Rendite vs. Volatilität (Einzeltitel, klein)
+#   - Kumulierte Performance (Basis/After)
+#   - Drawdown-Kurve
+#   - Rolling Vol & Rolling Sharpe
+#   - Histogramm der Tagesrenditen mit Normal-Overlay
+#   - Risk Contributions (CTR/MCTR) nach Volatilität
+#   - Monats-Return-Matrix & Worst-Months
+# - Export der Tickerliste im EU-CSV-Format
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -16,16 +33,17 @@ import yfinance as yf
 import streamlit as st
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
+from math import sqrt, pi, exp
 
 TRADING_DAYS = 252
 
 st.set_page_config(
-    page_title="Portfolio-Bewertung (manuelle Gewichtung)",
+    page_title="Institutionelles Portfolio-Risiko-Dashboard",
     page_icon="📊",
     layout="wide"
 )
 
-st.title("📊 Portfolio-Bewertung & Risiko – manuelle Gewichtung")
+st.title("📊 Institutionelles Portfolio-Risiko-Dashboard (manuelle Gewichtung)")
 
 # ─────────────────────────────────────────────
 # Sidebar – Universe, Lookback, Benchmarks
@@ -42,7 +60,7 @@ base_input = st.sidebar.text_input(
 base_tickers = [t.strip() for t in base_input.split(",") if t.strip()]
 
 extra_input = st.sidebar.text_input(
-    "Zusätzliche Aktien für Szenario (optional)",
+    "Zusätzliche Aktien für After-Szenario (optional)",
     value=""
 )
 extra_tickers = [t.strip() for t in extra_input.split(",") if t.strip()]
@@ -78,7 +96,7 @@ benchmark_ticker_dax = st.sidebar.text_input(
 )
 
 # ─────────────────────────────────────────────
-# Helper-Funktionen
+# Helper-Funktionen: Daten
 # ─────────────────────────────────────────────
 def load_prices(tickers, start, end):
     """
@@ -142,7 +160,9 @@ def load_benchmark_series(ticker, start, end):
         return None
     return s
 
-
+# ─────────────────────────────────────────────
+# Helper-Funktionen: Kennzahlen
+# ─────────────────────────────────────────────
 def annualized_return(returns, freq=TRADING_DAYS):
     r = returns.dropna()
     if r.empty:
@@ -188,11 +208,11 @@ def sortino_ratio(returns, risk_free_annual, freq=TRADING_DAYS):
     return (ann_ret - risk_free_annual) / dd
 
 
-def max_drawdown(returns):
+def drawdown_series(returns):
     cum = (1 + returns).cumprod()
     running_max = cum.cummax()
     dd = cum / running_max - 1.0
-    return dd.min()
+    return dd
 
 
 def hit_ratio(returns):
@@ -218,43 +238,198 @@ def beta_alpha(asset_ret, bench_ret, risk_free_annual, freq=TRADING_DAYS):
     return beta, alpha
 
 
+def tracking_error_and_ir(port_ret, bench_ret, freq=TRADING_DAYS):
+    df = pd.concat([port_ret, bench_ret], axis=1).dropna()
+    if df.shape[0] < 10:
+        return np.nan, np.nan
+    rp, rb = df.iloc[:, 0], df.iloc[:, 1]
+    diff = rp - rb
+    te = diff.std(ddof=1) * np.sqrt(freq)
+    ann_rp = annualized_return(rp, freq)
+    ann_rb = annualized_return(rb, freq)
+    if te == 0 or np.isnan(te):
+        ir = np.nan
+    else:
+        ir = (ann_rp - ann_rb) / te
+    return te, ir
+
+
+def capture_ratios(port_ret, bench_ret, freq=TRADING_DAYS):
+    df = pd.concat([port_ret, bench_ret], axis=1).dropna()
+    if df.shape[0] < 10:
+        return np.nan, np.nan
+    rp, rb = df.iloc[:, 0], df.iloc[:, 1]
+
+    mask_up = rb > 0
+    mask_down = rb < 0
+
+    if mask_up.sum() > 0:
+        up_port = annualized_return(rp[mask_up], freq)
+        up_bench = annualized_return(rb[mask_up], freq)
+        up_cap = up_port / up_bench if up_bench != 0 else np.nan
+    else:
+        up_cap = np.nan
+
+    if mask_down.sum() > 0:
+        down_port = annualized_return(rp[mask_down], freq)
+        down_bench = annualized_return(rb[mask_down], freq)
+        down_cap = down_port / down_bench if down_bench != 0 else np.nan
+    else:
+        down_cap = np.nan
+
+    return up_cap, down_cap
+
+
+def tail_metrics(returns):
+    r = returns.dropna()
+    if r.empty:
+        return (np.nan,) * 7
+    skew = r.skew()
+    kurt = r.kurtosis()
+    q05 = np.percentile(r, 5)
+    q95 = np.percentile(r, 95)
+    tail_ratio = q95 / abs(q05) if q05 != 0 else np.nan
+    var95 = q05
+    var99 = np.percentile(r, 1)
+    es95 = r[r <= q05].mean() if (r <= q05).any() else np.nan
+    es99 = r[r <= var99].mean() if (r <= var99).any() else np.nan
+    return skew, kurt, tail_ratio, var95, es95, var99, es99
+
+
 def portfolio_series(returns_df, weights):
     w = np.array(weights).reshape(-1, 1)
     return (returns_df @ w).squeeze()
+
+
+def rolling_sharpe(port_ret, risk_free_annual, window, freq=TRADING_DAYS):
+    if window <= 1:
+        return port_ret * np.nan
+    daily_rf = risk_free_annual / freq
+    ex = port_ret - daily_rf
+    roll_mean = ex.rolling(window).mean()
+    roll_std = ex.rolling(window).std(ddof=1)
+    rs = roll_mean / roll_std * np.sqrt(freq)
+    return rs
+
+
+def risk_contributions(returns_df, weights, freq=TRADING_DAYS):
+    """
+    Risk Contributions auf Basis der Kovarianzmatrix (annualisiert).
+    """
+    cov = returns_df.cov()
+    cov_annual = cov * freq
+    w = np.array(weights)
+    mat = cov_annual.values
+    port_var = float(w.T @ mat @ w)
+    port_vol = np.sqrt(port_var) if port_var >= 0 else np.nan
+    if port_vol == 0 or np.isnan(port_vol):
+        mctr = np.zeros_like(w)
+        ctr = np.zeros_like(w)
+        ctr_pct = np.zeros_like(w)
+    else:
+        mctr = (mat @ w) / port_vol
+        ctr = w * mctr
+        ctr_pct = ctr / port_vol
+    return port_vol, mctr, ctr, ctr_pct
+
+
+def monthly_return_matrix(port_ret):
+    """
+    Monatsreturns (resample) und Matrix Year x Month.
+    """
+    if not isinstance(port_ret.index, pd.DatetimeIndex):
+        return None, None
+    monthly = (1 + port_ret).resample('M').apply(lambda x: (1 + x).prod() - 1)
+    if monthly.empty:
+        return None, None
+    df = monthly.to_frame(name="Return")
+    df["Year"] = df.index.year
+    df["Month"] = df.index.strftime("%b")
+    pivot = df.pivot(index="Year", columns="Month", values="Return")
+    # Monate sortieren
+    month_order = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    cols = [m for m in month_order if m in pivot.columns]
+    pivot = pivot[cols]
+    return pivot, monthly
 
 
 def portfolio_stats(returns_df, weights,
                     risk_free_annual,
                     bench_spx=None,
                     bench_dax=None):
+    """
+    Portfolio-Kennzahlen + Benchmark-abhängige Metriken.
+    """
     port_ret = portfolio_series(returns_df, weights)
 
     ann_ret = annualized_return(port_ret)
     ann_vol = annualized_vol(port_ret)
     sr = sharpe_ratio(port_ret, risk_free_annual)
     so = sortino_ratio(port_ret, risk_free_annual)
-    mdd = max_drawdown(port_ret)
+
+    dd = drawdown_series(port_ret)
+    max_dd = dd.min()
+    if (dd < 0).any():
+        avg_dd = dd[dd < 0].mean()
+        med_dd = dd[dd < 0].median()
+        time_under_water = (dd < 0).mean()
+    else:
+        avg_dd = 0.0
+        med_dd = 0.0
+        time_under_water = 0.0
+
     hr = hit_ratio(port_ret)
 
     beta_spx, alpha_spx = (np.nan, np.nan)
     beta_dax, alpha_dax = (np.nan, np.nan)
+    te_spx, ir_spx = (np.nan, np.nan)
+    te_dax, ir_dax = (np.nan, np.nan)
+    up_spx, down_spx = (np.nan, np.nan)
+    up_dax, down_dax = (np.nan, np.nan)
 
     if bench_spx is not None:
         beta_spx, alpha_spx = beta_alpha(port_ret, bench_spx, risk_free_annual)
+        te_spx, ir_spx = tracking_error_and_ir(port_ret, bench_spx)
+        up_spx, down_spx = capture_ratios(port_ret, bench_spx)
+
     if bench_dax is not None:
         beta_dax, alpha_dax = beta_alpha(port_ret, bench_dax, risk_free_annual)
+        te_dax, ir_dax = tracking_error_and_ir(port_ret, bench_dax)
+        up_dax, down_dax = capture_ratios(port_ret, bench_dax)
+
+    skew, kurt, tail_ratio, var95, es95, var99, es99 = tail_metrics(port_ret)
 
     return {
         "Ann. Return": ann_ret,
         "Ann. Vol": ann_vol,
         "Sharpe": sr,
         "Sortino": so,
-        "Max Drawdown": mdd,
+        "Max Drawdown": max_dd,
+        "Avg Drawdown": avg_dd,
+        "Med Drawdown": med_dd,
+        "Time Under Water": time_under_water,
         "Hit Ratio": hr,
         "Beta_SPX": beta_spx,
         "Alpha_SPX": alpha_spx,
         "Beta_DAX": beta_dax,
         "Alpha_DAX": alpha_dax,
+        "TE_SPX": te_spx,
+        "IR_SPX": ir_spx,
+        "TE_DAX": te_dax,
+        "IR_DAX": ir_dax,
+        "Upside_SPX": up_spx,
+        "Downside_SPX": down_spx,
+        "Upside_DAX": up_dax,
+        "Downside_DAX": down_dax,
+        "Skew": skew,
+        "Kurtosis": kurt,
+        "TailRatio": tail_ratio,
+        "VaR95": var95,
+        "ES95": es95,
+        "VaR99": var99,
+        "ES99": es99,
+        "Port_Returns": port_ret,  # für weitere Analysen
     }
 
 
@@ -311,8 +486,8 @@ st.write(f"Aktive Titel: {', '.join(returns_all.columns)}")
 base_universe = [t for t in base_tickers if t in returns_all.columns]
 after_universe = [t for t in (base_tickers + extra_tickers) if t in returns_all.columns]
 
-returns_base = returns_all[base_universe]
-returns_after = returns_all[after_universe]
+returns_base = returns_all[base_universe] if base_universe else pd.DataFrame()
+returns_after = returns_all[after_universe] if after_universe else pd.DataFrame()
 
 # ─────────────────────────────────────────────
 # Einzelwert-Kennzahlen & Rendite/Vol-Scatter
@@ -334,7 +509,7 @@ for col in returns_all.columns:
         "Ann. Vol": annualized_vol(r),
         "Sharpe": sharpe_ratio(r, risk_free_annual),
         "Sortino": sortino_ratio(r, risk_free_annual),
-        "Max Drawdown": max_drawdown(r),
+        "Max Drawdown": drawdown_series(r).min(),
         "Hit Ratio": hit_ratio(r),
         "Beta_SPX": beta_spx,
         "Alpha_SPX": alpha_spx,
@@ -354,43 +529,36 @@ for c in ["Sharpe", "Sortino", "Beta_SPX", "Beta_DAX"]:
 st.subheader("Einzelwert-Kennzahlen")
 st.dataframe(display_df, use_container_width=True)
 
-# Scatter: Rendite vs. Volatilität (Einzeltitel) – sehr kleine Grafik, Achsen vertauscht
+# Scatter: Rendite vs. Volatilität – klein, Achsen vertauscht
 st.subheader("Rendite vs. Volatilität (Einzeltitel)")
 
-# deutlich kleinere Figure
-fig_scatter, ax_scatter = plt.subplots(figsize=(3.5, 2.5))  # Breite, Höhe in Inch
+fig_scatter, ax_scatter = plt.subplots(figsize=(2.5, 2.0))
 
 for ticker in asset_df.index:
     ret = asset_df.loc[ticker, "Ann. Return"]
     vol = asset_df.loc[ticker, "Ann. Vol"]
-    ax_scatter.scatter(ret, vol, s=6)  # s = Markergröße
+    ax_scatter.scatter(ret, vol, s=8)
     ax_scatter.annotate(
         ticker,
         (ret, vol),
         textcoords="offset points",
         xytext=(3, 2),
-        fontsize=5   # kleinere Schrift
+        fontsize=6
     )
 
-# vertikale Nulllinie für Rendite
 ax_scatter.axvline(0, linestyle="--", linewidth=0.6)
-
-ax_scatter.set_xlabel("Ann. Rendite", fontsize=6)
-ax_scatter.set_ylabel("Ann. Volatilität", fontsize=6)
-
-ax_scatter.tick_params(axis="both", labelsize=6)
-
+ax_scatter.set_xlabel("Ann. Rendite", fontsize=8)
+ax_scatter.set_ylabel("Ann. Volatilität", fontsize=8)
+ax_scatter.tick_params(axis="both", labelsize=7)
 fig_scatter.tight_layout(pad=0.5)
-
 st.pyplot(fig_scatter, use_container_width=False)
-
-
 
 # ─────────────────────────────────────────────
 # Manuelle Gewichte – Basisportfolio
 # ─────────────────────────────────────────────
 st.subheader("Portfolio-Gewichte – Basisportfolio")
 
+base_stats = None
 if not base_universe:
     st.warning("Keine der Basis-Ticker konnten geladen werden.")
 else:
@@ -415,7 +583,8 @@ else:
     else:
         w_base = w_base_raw / w_base_raw.sum()
 
-    st.caption(f"Gewichte werden intern auf Summe 100% normiert (aktuell: {w_base_raw.sum():.2f}%).")
+    st.caption(f"Basis: Gewichte werden intern auf Summe 100% normiert "
+               f"(aktuell: {w_base_raw.sum():.2f}%).")
 
     # Kennzahlen Basis-Portfolio
     base_stats = portfolio_stats(
@@ -433,12 +602,14 @@ else:
     colF.metric("Hit Ratio (Basis)", fmt_pct(base_stats["Hit Ratio"]))
 
 # ─────────────────────────────────────────────
-# Szenario „zusätzliche Aktien“ – Before/After-Struktur
+# Szenario: zusätzliche Aktien (After)
 # ─────────────────────────────────────────────
-st.subheader("Szenario: zusätzliche Aktien & Vergleich der Portfoliostruktur")
+st.subheader("Szenario: zusätzliche Aktien & Vergleich Basis vs. After")
 
-if not after_universe or after_universe == base_universe:
-    st.info("Gib im Sidebar-Feld 'Zusätzliche Aktien' Ticker ein, um ein After-Szenario zu sehen.")
+after_stats = None
+if not after_universe or after_universe == base_universe or base_stats is None:
+    st.info("Gib im Sidebar-Feld 'Zusätzliche Aktien' Ticker ein, "
+            "um ein After-Szenario inkl. Vergleich zu sehen.")
 else:
     n_after = len(after_universe)
     after_default_w = np.ones(n_after) / n_after * 100
@@ -461,7 +632,7 @@ else:
     else:
         w_after = w_after_raw / w_after_raw.sum()
 
-    st.caption(f"(After) Gewichte werden intern auf Summe 100% normiert "
+    st.caption(f"After: Gewichte werden intern auf Summe 100% normiert "
                f"(aktuell: {w_after_raw.sum():.2f}%).")
 
     returns_after_used = returns_all[after_universe]
@@ -472,10 +643,11 @@ else:
     col1, col2 = st.columns(2)
 
     with col1:
-        st.write("Basis-Portfolio – Gewichte:")
-        st.bar_chart(
-            pd.DataFrame({"Weight_%": w_base * 100}, index=base_universe)
-        )
+        if base_universe:
+            st.write("Basis-Portfolio – Gewichte:")
+            st.bar_chart(
+                pd.DataFrame({"Weight_%": w_base * 100}, index=base_universe)
+            )
 
     with col2:
         st.write("After-Portfolio – Gewichte:")
@@ -498,6 +670,10 @@ else:
                 "Alpha_SPX": base_stats["Alpha_SPX"],
                 "Beta_DAX": base_stats["Beta_DAX"],
                 "Alpha_DAX": base_stats["Alpha_DAX"],
+                "TE_SPX": base_stats["TE_SPX"],
+                "IR_SPX": base_stats["IR_SPX"],
+                "TE_DAX": base_stats["TE_DAX"],
+                "IR_DAX": base_stats["IR_DAX"],
             },
             "After": {
                 "Ann. Return": after_stats["Ann. Return"],
@@ -510,21 +686,223 @@ else:
                 "Alpha_SPX": after_stats["Alpha_SPX"],
                 "Beta_DAX": after_stats["Beta_DAX"],
                 "Alpha_DAX": after_stats["Alpha_DAX"],
+                "TE_SPX": after_stats["TE_SPX"],
+                "IR_SPX": after_stats["IR_SPX"],
+                "TE_DAX": after_stats["TE_DAX"],
+                "IR_DAX": after_stats["IR_DAX"],
             },
         }
     )
 
-    # Formatierung für Anzeige
     disp_compare = compare_df.copy()
-    for row in ["Ann. Return", "Ann. Vol", "Max Drawdown", "Hit Ratio", "Alpha_SPX", "Alpha_DAX"]:
+    for row in ["Ann. Return", "Ann. Vol", "Max Drawdown", "Hit Ratio",
+                "Alpha_SPX", "Alpha_DAX", "TE_SPX", "TE_DAX"]:
         disp_compare.loc[row, :] = disp_compare.loc[row, :].apply(fmt_pct)
-    for row in ["Sharpe", "Sortino", "Beta_SPX", "Beta_DAX"]:
+    for row in ["Sharpe", "Sortino", "Beta_SPX", "Beta_DAX", "IR_SPX", "IR_DAX"]:
         disp_compare.loc[row, :] = disp_compare.loc[row, :].apply(fmt_ratio)
 
     st.dataframe(disp_compare, use_container_width=True)
 
 # ─────────────────────────────────────────────
-# Download der Ticker als CSV (EU-Format)
+# Risiko-Analyse: Drawdown, Rolling, Histogramm, Tail
+# ─────────────────────────────────────────────
+st.subheader("Risiko-Analyse & Tail-Metriken")
+
+# Auswahl, welches Portfolio für tiefere Risikoanalyse verwendet wird
+portfolio_choices = {}
+if base_stats is not None:
+    portfolio_choices["Basis"] = {
+        "returns_df": returns_base,
+        "weights": w_base,
+        "stats": base_stats
+    }
+if after_stats is not None:
+    portfolio_choices["After"] = {
+        "returns_df": returns_after_used,
+        "weights": w_after,
+        "stats": after_stats
+    }
+
+if not portfolio_choices:
+    st.info("Kein Portfolio mit definierten Gewichten verfügbar für Risikoanalyse.")
+else:
+    selected_name = st.selectbox("Portfolio für Risikoanalyse auswählen",
+                                 list(portfolio_choices.keys()))
+    sel = portfolio_choices[selected_name]
+    sel_ret_df = sel["returns_df"]
+    sel_w = sel["weights"]
+    sel_stats = sel["stats"]
+    port_ret = sel_stats["Port_Returns"]
+
+    # Drawdown-Kurve
+    dd = drawdown_series(port_ret)
+
+    col_r1, col_r2 = st.columns([2, 1])
+
+    with col_r1:
+        st.write("Drawdown-Kurve")
+        fig_dd, ax_dd = plt.subplots(figsize=(4, 2.5))
+        dd.plot(ax=ax_dd)
+        ax_dd.set_title(f"Drawdown {selected_name}")
+        ax_dd.set_ylabel("Drawdown")
+        ax_dd.set_xlabel("")
+        ax_dd.axhline(0, color="black", linewidth=0.5)
+        ax_dd.tick_params(labelsize=7)
+        fig_dd.tight_layout(pad=0.5)
+        st.pyplot(fig_dd, use_container_width=False)
+
+    with col_r2:
+        st.write("Tail- & Downside-Metriken")
+        col_m1, col_m2 = st.columns(2)
+        col_m1.metric("VaR 95% (daily)", fmt_pct(sel_stats["VaR95"]))
+        col_m2.metric("ES 95% (daily)", fmt_pct(sel_stats["ES95"]))
+        col_m1.metric("VaR 99% (daily)", fmt_pct(sel_stats["VaR99"]))
+        col_m2.metric("ES 99% (daily)", fmt_pct(sel_stats["ES99"]))
+        col_m1.metric("Skew", fmt_ratio(sel_stats["Skew"]))
+        col_m2.metric("Kurtosis", fmt_ratio(sel_stats["Kurtosis"]))
+        col_m1.metric("Time Under Water", fmt_pct(sel_stats["Time Under Water"]))
+        col_m2.metric("Avg Drawdown", fmt_pct(sel_stats["Avg Drawdown"]))
+
+    # Rolling Vol & Rolling Sharpe
+    st.write("Rolling Volatilität & Rolling Sharpe (6M-Fenster)")
+
+    window = min(126, max(20, len(port_ret) // 3))  # dynamischer, aber meist ~6M
+    roll_vol = port_ret.rolling(window).std(ddof=1) * np.sqrt(TRADING_DAYS)
+    roll_sharpe = rolling_sharpe(port_ret, risk_free_annual, window)
+
+    fig_roll, ax_roll = plt.subplots(figsize=(4.5, 2.5))
+    roll_vol.plot(ax=ax_roll, label="Rolling Vol (ann.)")
+    ax_roll.set_ylabel("Volatilität", fontsize=8)
+    ax_roll.tick_params(axis="y", labelsize=7)
+    ax_roll.tick_params(axis="x", labelsize=7)
+
+    ax2 = ax_roll.twinx()
+    roll_sharpe.plot(ax=ax2, color="tab:red", label="Rolling Sharpe")
+    ax2.set_ylabel("Sharpe", fontsize=8)
+    ax2.tick_params(axis="y", labelsize=7)
+
+    ax_roll.set_title(f"Rolling Risk Metrics ({selected_name})")
+    lines, labels = ax_roll.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax_roll.legend(lines + lines2, labels + labels2, fontsize=7, loc="upper left")
+    fig_roll.tight_layout(pad=0.5)
+    st.pyplot(fig_roll, use_container_width=False)
+
+    # Histogramm + Normal-Overlay
+    st.write("Verteilung der Tagesrenditen (Histogramm + Normal-Overlay)")
+
+    r = port_ret.dropna()
+    if not r.empty:
+        mu = r.mean()
+        sigma = r.std(ddof=1)
+
+        fig_hist, ax_hist = plt.subplots(figsize=(3.0, 2.2))
+        ax_hist.hist(r, bins=40, density=True, alpha=0.6)
+        if sigma > 0:
+            x_vals = np.linspace(mu - 4 * sigma, mu + 4 * sigma, 200)
+            pdf = 1.0 / (sigma * sqrt(2 * pi)) * np.exp(-0.5 * ((x_vals - mu) / sigma) ** 2)
+            ax_hist.plot(x_vals, pdf, linewidth=1.0)
+        ax_hist.set_title(f"Return-Distribution {selected_name}", fontsize=8)
+        ax_hist.tick_params(axis="both", labelsize=7)
+        fig_hist.tight_layout(pad=0.5)
+        st.pyplot(fig_hist, use_container_width=False)
+
+    # Tracking Error, IR, Capture Ratios
+    st.write("Benchmark-bezogene Kennzahlen")
+
+    bench_table_rows = []
+    for label, br, te_key, ir_key, up_key, down_key in [
+        ("S&P500", bench_ret_spx, "TE_SPX", "IR_SPX", "Upside_SPX", "Downside_SPX"),
+        ("DAX", bench_ret_dax, "TE_DAX", "IR_DAX", "Upside_DAX", "Downside_DAX"),
+    ]:
+        if br is None:
+            continue
+        bench_table_rows.append({
+            "Benchmark": label,
+            "Tracking Error": sel_stats[te_key],
+            "Information Ratio": sel_stats[ir_key],
+            "Upside Capture": sel_stats[up_key],
+            "Downside Capture": sel_stats[down_key],
+        })
+
+    if bench_table_rows:
+        bench_df = pd.DataFrame(bench_table_rows).set_index("Benchmark")
+        display_bench = bench_df.copy()
+        display_bench["Tracking Error"] = display_bench["Tracking Error"].apply(fmt_pct)
+        display_bench["Information Ratio"] = display_bench["Information Ratio"].apply(fmt_ratio)
+        display_bench["Upside Capture"] = display_bench["Upside Capture"].apply(
+            lambda x: "n/a" if np.isnan(x) else f"{x*100:,.1f}%"
+        )
+        display_bench["Downside Capture"] = display_bench["Downside Capture"].apply(
+            lambda x: "n/a" if np.isnan(x) else f"{x*100:,.1f}%"
+        )
+        st.dataframe(display_bench, use_container_width=True)
+
+    # Monatsmatrix & Worst-Months
+    st.write("Monatsreturns & Stress-Monate")
+
+    pivot_months, monthly_series = monthly_return_matrix(port_ret)
+    if pivot_months is not None:
+        fmt_pivot = pivot_months.applymap(lambda x: fmt_pct(x) if pd.notna(x) else "")
+        st.dataframe(fmt_pivot, use_container_width=True)
+        worst_months = monthly_series.nsmallest(5)
+        worst_df = worst_months.to_frame(name="Return")
+        worst_df["Year"] = worst_df.index.year
+        worst_df["Month"] = worst_df.index.strftime("%b")
+        worst_df["Return_fmt"] = worst_df["Return"].apply(fmt_pct)
+        st.write("Schlechteste 5 Monate im Sample:")
+        st.dataframe(
+            worst_df[["Year", "Month", "Return_fmt"]],
+            use_container_width=True
+        )
+
+# ─────────────────────────────────────────────
+# Risk Contributions (MCTR / CTR)
+# ─────────────────────────────────────────────
+st.subheader("Risk Contributions (Volatilitätsbeitrag je Titel)")
+
+if not portfolio_choices:
+    st.info("Für Risk Contributions muss mindestens ein Portfolio mit Gewichten vorliegen.")
+else:
+    rc_choice = st.selectbox("Portfolio für Risk Contributions auswählen",
+                             list(portfolio_choices.keys()),
+                             key="rc_choice")
+    rc_sel = portfolio_choices[rc_choice]
+    rc_ret_df = rc_sel["returns_df"]
+    rc_w = rc_sel["weights"]
+
+    port_vol, mctr, ctr, ctr_pct = risk_contributions(rc_ret_df, rc_w)
+    tickers_rc = rc_ret_df.columns
+
+    rc_df = pd.DataFrame({
+        "Ticker": tickers_rc,
+        "Weight_%": rc_w * 100,
+        "MCTR": mctr,
+        "CTR": ctr,
+        "CTR_% of Risk": ctr_pct * 100
+    }).set_index("Ticker")
+
+    rc_display = rc_df.copy()
+    rc_display["Weight_%"] = rc_display["Weight_%"].apply(lambda x: f"{x:,.2f}%")
+    rc_display["CTR_% of Risk"] = rc_display["CTR_% of Risk"].apply(lambda x: f"{x:,.2f}%")
+    rc_display["MCTR"] = rc_display["MCTR"].apply(lambda x: f"{x:,.4f}")
+    rc_display["CTR"] = rc_display["CTR"].apply(lambda x: f"{x:,.4f}")
+
+    st.write(f"Portfolio-Volatilität (ann.): {fmt_pct(port_vol)}")
+    st.dataframe(rc_display, use_container_width=True)
+
+    st.write("Gewicht vs. Risikobeitrag (% vom Gesamt-Risiko)")
+
+    fig_rc, ax_rc = plt.subplots(figsize=(4.0, 2.4))
+    ax_rc.bar(tickers_rc, rc_df["CTR_% of Risk"])
+    ax_rc.set_ylabel("% of Total Volatilität", fontsize=8)
+    ax_rc.set_xticklabels(tickers_rc, rotation=45, ha="right", fontsize=7)
+    ax_rc.tick_params(axis="y", labelsize=7)
+    fig_rc.tight_layout(pad=0.5)
+    st.pyplot(fig_rc, use_container_width=False)
+
+# ─────────────────────────────────────────────
+# Export: Ticker-Liste als CSV (EU-Format)
 # ─────────────────────────────────────────────
 st.subheader("Export: Ticker-Liste als CSV (EU-Format)")
 
