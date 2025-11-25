@@ -1,9 +1,11 @@
-# portfolio_risk_tool.py
-# Streamlit-Tool für Portfolio-Bewertung & Sortino-Optimierung
-# - verwendet ausschließlich den Close-Preis
-# - min. Gewicht je Aktie: 5% (falls machbar)
-# - Beta/Alpha vs S&P500 (^GSPC) und DAX (^GDAXI)
-# - Kennzahlen für Equal-Weight- und Optimized-Portfolio
+# portfolio_risk_tool_manual.py
+# Streamlit-Tool für Portfolio-Bewertung & manuelle Gewichtung
+# - Close-Prices
+# - Lookback in Monaten (bis 36)
+# - Manuelle Gewichte (Standard: Equal Weight)
+# - Scatter: Rendite vs. Volatilität je Aktie
+# - Szenario: zusätzliche Aktien (Before/After-Strukturvergleich)
+# - Download der Ticker als CSV (EU-Format)
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -14,45 +16,47 @@ import yfinance as yf
 import streamlit as st
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
-from scipy.optimize import minimize
 
 TRADING_DAYS = 252
-MIN_WEIGHT = 0.05  # 5% Mindestgewicht pro Aktie
 
 st.set_page_config(
-    page_title="Portfolio-Bewertung & Sortino-Optimierung",
+    page_title="Portfolio-Bewertung (manuelle Gewichtung)",
     page_icon="📊",
     layout="wide"
 )
 
-st.title("📊 Portfolio-Bewertung & Sortino-Optimierung")
+st.title("📊 Portfolio-Bewertung & Risiko – manuelle Gewichtung")
 
 # ─────────────────────────────────────────────
-# Sidebar
+# Sidebar – Universe, Lookback, Benchmarks
 # ─────────────────────────────────────────────
-default_tickers = "REGN,LULU,VOW3.DE,REI,DDL,NOV,SRPT,CAG,CMCSA"
-
 st.sidebar.header("Universe & Einstellungen")
 
-tickers_input = st.sidebar.text_input(
-    "Ticker (kommagetrennt)",
-    value=default_tickers
+default_base = "REGN,LULU,VOW3.DE,REI,DDL,NOV,SRPT,CAG,CMCSA"
+
+base_input = st.sidebar.text_input(
+    "Basis-Portfolio (Ticker, kommasepariert)",
+    value=default_base,
 )
 
-tickers = [t.strip() for t in tickers_input.split(",") if t.strip()]
-if not tickers:
-    st.error("Bitte mindestens einen Ticker eingeben.")
-    st.stop()
+base_tickers = [t.strip() for t in base_input.split(",") if t.strip()]
 
-years_back = st.sidebar.slider(
-    "Lookback (Jahre)",
+extra_input = st.sidebar.text_input(
+    "Zusätzliche Aktien für Szenario (optional)",
+    value=""
+)
+extra_tickers = [t.strip() for t in extra_input.split(",") if t.strip()]
+
+# Lookback in Monaten
+months_back = st.sidebar.slider(
+    "Lookback (Monate)",
     min_value=1,
-    max_value=10,
-    value=3
+    max_value=36,
+    value=12
 )
 
 end_date = datetime.today()
-start_date = end_date - timedelta(days=365 * years_back)
+start_date = end_date - timedelta(days=months_back * 30)  # grobe Approximation
 
 risk_free_annual = st.sidebar.number_input(
     "Risikofreier Zins p.a.",
@@ -73,19 +77,13 @@ benchmark_ticker_dax = st.sidebar.text_input(
     value="^GDAXI"
 )
 
-optimize_objective = st.sidebar.selectbox(
-    "Optimierungsziel",
-    ["Sortino Ratio (maximieren)", "Sharpe Ratio (maximieren)"],
-    index=0
-)
-
 # ─────────────────────────────────────────────
 # Helper-Funktionen
 # ─────────────────────────────────────────────
 def load_prices(tickers, start, end):
     """
-    Robustes Laden: pro Ticker, verwendet ausschließlich 'Close'.
-    Gibt prices, OK-Ticker, fehlende Ticker zurück.
+    Pro Ticker Close-Kurse laden.
+    Gibt prices, ok_tickers, missing_tickers zurück.
     """
     series_list = []
     ok = []
@@ -104,21 +102,16 @@ def load_prices(tickers, start, end):
             missing.append(t)
             continue
 
-        if data is None or data.empty:
+        if data is None or data.empty or "Close" not in data.columns:
             missing.append(t)
             continue
 
-        # NUR Close verwenden
-        if "Close" not in data.columns:
-            missing.append(t)
-            continue
-
-        s = data["Close"].copy().dropna()
+        s = data["Close"].dropna()
         if s.empty:
             missing.append(t)
             continue
 
-        s.name = t  # Name setzen statt rename()
+        s.name = t
         series_list.append(s)
         ok.append(t)
 
@@ -130,9 +123,6 @@ def load_prices(tickers, start, end):
 
 
 def load_benchmark_series(ticker, start, end):
-    """
-    Benchmark-Serie laden, ausschließlich 'Close' verwenden.
-    """
     try:
         data = yf.download(
             ticker,
@@ -212,11 +202,8 @@ def hit_ratio(returns):
     return (r > 0).mean()
 
 
-def beta_alpha(port_ret, bench_ret, risk_free_annual, freq=TRADING_DAYS):
-    """
-    Beta & Alpha nach CAPM gegen eine Benchmark.
-    """
-    df = pd.concat([port_ret, bench_ret], axis=1).dropna()
+def beta_alpha(asset_ret, bench_ret, risk_free_annual, freq=TRADING_DAYS):
+    df = pd.concat([asset_ret, bench_ret], axis=1).dropna()
     if df.shape[0] < 10:
         return np.nan, np.nan
     rp, rb = df.iloc[:, 0], df.iloc[:, 1]
@@ -231,17 +218,16 @@ def beta_alpha(port_ret, bench_ret, risk_free_annual, freq=TRADING_DAYS):
     return beta, alpha
 
 
-def portfolio_stats(weights,
-                    returns_df,
-                    risk_free_annual,
-                    bench_ret_spx=None,
-                    bench_ret_dax=None):
-    """
-    Kennzahlen für ein Portfolio mit gegebenen Gewichten.
-    Zusätzlich Beta/Alpha vs. S&P500 und DAX.
-    """
+def portfolio_series(returns_df, weights):
     w = np.array(weights).reshape(-1, 1)
-    port_ret = (returns_df @ w).squeeze()
+    return (returns_df @ w).squeeze()
+
+
+def portfolio_stats(returns_df, weights,
+                    risk_free_annual,
+                    bench_spx=None,
+                    bench_dax=None):
+    port_ret = portfolio_series(returns_df, weights)
 
     ann_ret = annualized_return(port_ret)
     ann_vol = annualized_vol(port_ret)
@@ -253,10 +239,10 @@ def portfolio_stats(weights,
     beta_spx, alpha_spx = (np.nan, np.nan)
     beta_dax, alpha_dax = (np.nan, np.nan)
 
-    if bench_ret_spx is not None:
-        beta_spx, alpha_spx = beta_alpha(port_ret, bench_ret_spx, risk_free_annual)
-    if bench_ret_dax is not None:
-        beta_dax, alpha_dax = beta_alpha(port_ret, bench_ret_dax, risk_free_annual)
+    if bench_spx is not None:
+        beta_spx, alpha_spx = beta_alpha(port_ret, bench_spx, risk_free_annual)
+    if bench_dax is not None:
+        beta_dax, alpha_dax = beta_alpha(port_ret, bench_dax, risk_free_annual)
 
     return {
         "Ann. Return": ann_ret,
@@ -272,80 +258,6 @@ def portfolio_stats(weights,
     }
 
 
-def average_correlation(corr_matrix):
-    n = corr_matrix.shape[0]
-    if n <= 1:
-        return np.nan
-    vals = corr_matrix.values
-    upper = vals[np.triu_indices(n, k=1)]
-    return upper.mean()
-
-
-def optimize_weights(returns_df,
-                     risk_free_annual,
-                     objective="sortino",
-                     long_only=True,
-                     min_weight=MIN_WEIGHT):
-    """
-    Optimiert Gewichte bzgl. Sortino oder Sharpe.
-    Long-only, Summe=1.
-    Mindestgewicht pro Asset: min_weight (sofern machbar).
-    """
-    n = returns_df.shape[1]
-    w0 = np.ones(n) / n
-
-    eff_min = min_weight
-    if long_only and n * eff_min > 1.0:
-        # 5% Mindestgewicht ist bei zu vielen Titeln nicht machbar
-        st.warning(
-            f"Minimales Gewicht von {min_weight:.0%} ist mit {n} Titeln nicht machbar. "
-            "Setze Untergrenze auf 0%."
-        )
-        eff_min = 0.0
-
-    bounds = None
-    if long_only:
-        bounds = [(eff_min, 1.0)] * n
-
-    constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
-
-    def port_ret_from_w(w):
-        return returns_df @ np.array(w)
-
-    def neg_sortino(w):
-        r = port_ret_from_w(w)
-        val = sortino_ratio(r, risk_free_annual)
-        return -val if not np.isnan(val) else 1e6
-
-    def neg_sharpe(w):
-        r = port_ret_from_w(w)
-        val = sharpe_ratio(r, risk_free_annual)
-        return -val if not np.isnan(val) else 1e6
-
-    fun = neg_sortino if objective.lower().startswith("sortino") else neg_sharpe
-
-    res = minimize(
-        fun,
-        w0,
-        method="SLSQP",
-        bounds=bounds,
-        constraints=constraints,
-        options={"maxiter": 1000, "disp": False},
-    )
-
-    if not res.success:
-        st.warning(f"Optimierung nicht konvergent: {res.message}")
-        return w0
-
-    w_opt = res.x
-    # numerische Artefakte bereinigen
-    w_opt[w_opt < 0] = 0.0
-    s = w_opt.sum()
-    if s != 0:
-        w_opt /= s
-    return w_opt
-
-
 def fmt_pct(x):
     return "n/a" if x is None or (isinstance(x, float) and np.isnan(x)) else f"{x*100:,.2f}%"
 
@@ -357,52 +269,64 @@ def fmt_ratio(x):
 # ─────────────────────────────────────────────
 # Daten laden
 # ─────────────────────────────────────────────
-with st.spinner("Lade Kursdaten..."):
-    prices, ok_tickers, missing_tickers = load_prices(tickers, start_date, end_date)
+all_input_tickers = base_tickers + extra_tickers
+all_input_tickers = [t for t in all_input_tickers if t]  # cleanup
 
-if prices.empty:
+if not all_input_tickers:
+    st.error("Bitte mindestens einen Ticker im Basis-Portfolio eingeben.")
+    st.stop()
+
+with st.spinner("Lade Kursdaten..."):
+    prices_all, ok_tickers, missing_tickers = load_prices(all_input_tickers, start_date, end_date)
+
+if prices_all.empty:
     st.error("Keine Kursdaten gefunden. Prüfe Ticker, Internet-Verbindung oder Zeitraum.")
     if missing_tickers:
         st.warning("Keine Daten für: " + ", ".join(missing_tickers))
     st.stop()
 
 if missing_tickers:
-    st.warning(
-        "Folgende Ticker konnten nicht geladen werden und wurden ignoriert: "
-        + ", ".join(missing_tickers)
-    )
+    st.warning("Folgende Ticker konnten nicht geladen werden und wurden ignoriert: "
+               + ", ".join(missing_tickers))
 
-returns = prices.pct_change().dropna()
+returns_all = prices_all.pct_change().dropna()
 
-# Benchmarks (Close)
+# Benchmarks
 bench_spx = load_benchmark_series(benchmark_ticker_spx, start_date, end_date)
 bench_dax = load_benchmark_series(benchmark_ticker_dax, start_date, end_date)
 
-bench_returns_spx = bench_spx.pct_change().dropna() if bench_spx is not None else None
-bench_returns_dax = bench_dax.pct_change().dropna() if bench_dax is not None else None
+bench_ret_spx = bench_spx.pct_change().dropna() if bench_spx is not None else None
+bench_ret_dax = bench_dax.pct_change().dropna() if bench_dax is not None else None
 
-if bench_returns_spx is None:
+if bench_ret_spx is None:
     st.warning("Benchmark S&P500 konnte nicht geladen werden.")
-if bench_returns_dax is None:
+if bench_ret_dax is None:
     st.warning("Benchmark DAX konnte nicht geladen werden.")
 
 st.subheader("Basisdaten")
-st.write(f"Zeitraum: {start_date.date()} bis {end_date.date()}  •  {returns.shape[0]} Handelstage")
-st.write(f"Aktive Titel im Universe: {', '.join(returns.columns)}")
+st.write(f"Zeitraum: {start_date.date()} bis {end_date.date()}  •  {returns_all.shape[0]} Handelstage")
+st.write(f"Aktive Titel: {', '.join(returns_all.columns)}")
+
+# Base- & After-Universen auf tatsächlich verfügbare Ticker einschränken
+base_universe = [t for t in base_tickers if t in returns_all.columns]
+after_universe = [t for t in (base_tickers + extra_tickers) if t in returns_all.columns]
+
+returns_base = returns_all[base_universe]
+returns_after = returns_all[after_universe]
 
 # ─────────────────────────────────────────────
-# Einzelwert-Kennzahlen inkl. Beta/Alpha
+# Einzelwert-Kennzahlen & Rendite/Vol-Scatter
 # ─────────────────────────────────────────────
 rows = []
-for col in returns.columns:
-    r = returns[col]
+for col in returns_all.columns:
+    r = returns_all[col]
     beta_spx, alpha_spx = (np.nan, np.nan)
     beta_dax, alpha_dax = (np.nan, np.nan)
 
-    if bench_returns_spx is not None:
-        beta_spx, alpha_spx = beta_alpha(r, bench_returns_spx, risk_free_annual)
-    if bench_returns_dax is not None:
-        beta_dax, alpha_dax = beta_alpha(r, bench_returns_dax, risk_free_annual)
+    if bench_ret_spx is not None:
+        beta_spx, alpha_spx = beta_alpha(r, bench_ret_spx, risk_free_annual)
+    if bench_ret_dax is not None:
+        beta_dax, alpha_dax = beta_alpha(r, bench_ret_dax, risk_free_annual)
 
     rows.append({
         "Ticker": col,
@@ -427,143 +351,181 @@ for c in ["Ann. Return", "Ann. Vol", "Max Drawdown", "Hit Ratio", "Alpha_SPX", "
 for c in ["Sharpe", "Sortino", "Beta_SPX", "Beta_DAX"]:
     display_df[c] = display_df[c].apply(fmt_ratio)
 
-st.subheader("Einzelwert-Kennzahlen (inkl. Beta/Alpha vs. S&P500 & DAX)")
+st.subheader("Einzelwert-Kennzahlen")
 st.dataframe(display_df, use_container_width=True)
 
-# ─────────────────────────────────────────────
-# Portfolio: Equal vs. Optimized
-# ─────────────────────────────────────────────
-n_assets = returns.shape[1]
-w_equal = np.ones(n_assets) / n_assets
+# Scatter: Rendite vs. Volatilität
+st.subheader("Rendite vs. Volatilität (Einzeltitel)")
 
-objective_label = "Sortino" if optimize_objective.startswith("Sortino") else "Sharpe"
+fig_scatter, ax_scatter = plt.subplots()
+for ticker in asset_df.index:
+    vol = asset_df.loc[ticker, "Ann. Vol"]
+    ret = asset_df.loc[ticker, "Ann. Return"]
+    ax_scatter.scatter(vol, ret)
+    ax_scatter.annotate(ticker, (vol, ret), textcoords="offset points", xytext=(5, 3), fontsize=8)
 
-st.subheader(f"Portfolio-Optimierung ({objective_label}-maximierend, min. Gewicht 5%)")
-
-w_opt = optimize_weights(
-    returns,
-    risk_free_annual,
-    objective="sortino" if objective_label == "Sortino" else "sharpe",
-    long_only=True,
-    min_weight=MIN_WEIGHT
-)
-
-weights_df = pd.DataFrame({
-    "Ticker": returns.columns,
-    "Equal Weight": w_equal,
-    "Optimized Weight": w_opt
-}).set_index("Ticker")
-
-for c in ["Equal Weight", "Optimized Weight"]:
-    weights_df[c] = weights_df[c].apply(lambda x: f"{100*x:,.2f}%")
-
-st.write("Gewichte (gleichgewichtet vs. optimiert):")
-st.dataframe(weights_df, use_container_width=True)
-
-# Kennzahlen für beide Portfolios
-port_equal_stats = portfolio_stats(
-    w_equal, returns, risk_free_annual, bench_returns_spx, bench_returns_dax
-)
-port_opt_stats = portfolio_stats(
-    w_opt, returns, risk_free_annual, bench_returns_spx, bench_returns_dax
-)
-
-def stats_to_df(label, stats_dict):
-    row = stats_dict.copy()
-    row["Portfolio"] = label
-    return row
-
-stats_df = pd.DataFrame([
-    stats_to_df("Equal Weight", port_equal_stats),
-    stats_to_df("Optimized", port_opt_stats),
-]).set_index("Portfolio")
-
-# Formatierung
-for c in ["Ann. Return", "Ann. Vol", "Max Drawdown", "Hit Ratio", "Alpha_SPX", "Alpha_DAX"]:
-    stats_df[c] = stats_df[c].apply(fmt_pct)
-
-for c in ["Sharpe", "Sortino", "Beta_SPX", "Beta_DAX"]:
-    stats_df[c] = stats_df[c].apply(fmt_ratio)
-
-st.write("Portfolio-Kennzahlen (Equal vs. Optimized):")
-st.dataframe(stats_df, use_container_width=True)
+ax_scatter.axhline(0, linestyle="--", linewidth=0.8)
+ax_scatter.set_xlabel("Ann. Volatilität")
+ax_scatter.set_ylabel("Ann. Rendite")
+st.pyplot(fig_scatter)
 
 # ─────────────────────────────────────────────
-# Risikokennzahlen der Optimierung (Explizit)
+# Manuelle Gewichte – Basisportfolio
 # ─────────────────────────────────────────────
-st.subheader("Risikokennzahlen des optimierten Portfolios")
+st.subheader("Portfolio-Gewichte – Basisportfolio")
 
-col_a, col_b, col_c = st.columns(3)
-col_d, col_e, col_f = st.columns(3)
+if not base_universe:
+    st.warning("Keine der Basis-Ticker konnten geladen werden.")
+else:
+    n_base = len(base_universe)
+    base_default_w = np.ones(n_base) / n_base * 100  # Prozent
 
-col_a.metric(
-    "Ann. Return (Optimized)",
-    fmt_pct(port_opt_stats["Ann. Return"]),
-    delta=fmt_pct(port_opt_stats["Ann. Return"] - port_equal_stats["Ann. Return"])
-)
+    base_weights_df = pd.DataFrame({
+        "Ticker": base_universe,
+        "Weight_%": np.round(base_default_w, 2)
+    })
 
-col_b.metric(
-    "Ann. Vol (Optimized)",
-    fmt_pct(port_opt_stats["Ann. Vol"]),
-    delta=fmt_pct(port_opt_stats["Ann. Vol"] - port_equal_stats["Ann. Vol"])
-)
+    edited_base = st.data_editor(
+        base_weights_df,
+        key="base_weights_editor",
+        use_container_width=True,
+        num_rows="fixed"
+    )
 
-col_c.metric(
-    "Max Drawdown (Optimized)",
-    fmt_pct(port_opt_stats["Max Drawdown"]),
-    delta=fmt_pct(port_opt_stats["Max Drawdown"] - port_equal_stats["Max Drawdown"])
-)
+    w_base_raw = edited_base["Weight_%"].values.astype(float)
+    if w_base_raw.sum() == 0:
+        w_base = np.ones_like(w_base_raw) / len(w_base_raw)
+    else:
+        w_base = w_base_raw / w_base_raw.sum()
 
-col_d.metric(
-    "Sharpe (Optimized)",
-    fmt_ratio(port_opt_stats["Sharpe"]),
-    delta=fmt_ratio(port_opt_stats["Sharpe"] - port_equal_stats["Sharpe"])
-)
+    st.caption(f"Gewichte werden intern auf Summe 100% normiert (aktuell: {w_base_raw.sum():.2f}%).")
 
-col_e.metric(
-    "Sortino (Optimized)",
-    fmt_ratio(port_opt_stats["Sortino"]),
-    delta=fmt_ratio(port_opt_stats["Sortino"] - port_equal_stats["Sortino"])
-)
+    # Kennzahlen Basis-Portfolio
+    base_stats = portfolio_stats(
+        returns_base, w_base, risk_free_annual, bench_ret_spx, bench_ret_dax
+    )
 
-col_f.metric(
-    "Hit Ratio (Optimized)",
-    fmt_pct(port_opt_stats["Hit Ratio"]),
-    delta=fmt_pct(port_opt_stats["Hit Ratio"] - port_equal_stats["Hit Ratio"])
-)
+    colA, colB, colC = st.columns(3)
+    colD, colE, colF = st.columns(3)
+
+    colA.metric("Ann. Return (Basis)", fmt_pct(base_stats["Ann. Return"]))
+    colB.metric("Ann. Vol (Basis)", fmt_pct(base_stats["Ann. Vol"]))
+    colC.metric("Max Drawdown (Basis)", fmt_pct(base_stats["Max Drawdown"]))
+    colD.metric("Sharpe (Basis)", fmt_ratio(base_stats["Sharpe"]))
+    colE.metric("Sortino (Basis)", fmt_ratio(base_stats["Sortino"]))
+    colF.metric("Hit Ratio (Basis)", fmt_pct(base_stats["Hit Ratio"]))
 
 # ─────────────────────────────────────────────
-# Korrelation & Performance
+# Szenario „zusätzliche Aktien“ – Before/After-Struktur
 # ─────────────────────────────────────────────
-st.subheader("Korrelation & Risiko-Struktur")
+st.subheader("Szenario: zusätzliche Aktien & Vergleich der Portfoliostruktur")
 
-corr = returns.corr()
-avg_corr = average_correlation(corr)
+if not after_universe or after_universe == base_universe:
+    st.info("Gib im Sidebar-Feld 'Zusätzliche Aktien' Ticker ein, um ein After-Szenario zu sehen.")
+else:
+    n_after = len(after_universe)
+    after_default_w = np.ones(n_after) / n_after * 100
 
-col1, col2 = st.columns([2, 1])
+    after_weights_df = pd.DataFrame({
+        "Ticker": after_universe,
+        "Weight_%": np.round(after_default_w, 2)
+    })
 
-with col1:
-    st.write("Korrelationsmatrix (Tagesrenditen):")
-    st.dataframe(corr.style.format("{:.2f}"), use_container_width=True)
+    edited_after = st.data_editor(
+        after_weights_df,
+        key="after_weights_editor",
+        use_container_width=True,
+        num_rows="fixed"
+    )
 
-with col2:
-    st.metric("Ø Paar-Korrelation im Portfolio", f"{avg_corr:,.2f}")
+    w_after_raw = edited_after["Weight_%"].values.astype(float)
+    if w_after_raw.sum() == 0:
+        w_after = np.ones_like(w_after_raw) / len(w_after_raw)
+    else:
+        w_after = w_after_raw / w_after_raw.sum()
 
-    port_equal_ret = (returns @ w_equal).dropna()
-    port_opt_ret = (returns @ w_opt).dropna()
+    st.caption(f"(After) Gewichte werden intern auf Summe 100% normiert "
+               f"(aktuell: {w_after_raw.sum():.2f}%).")
 
-    cum_equal = (1 + port_equal_ret).cumprod()
-    cum_opt = (1 + port_opt_ret).cumprod()
+    returns_after_used = returns_all[after_universe]
+    after_stats = portfolio_stats(
+        returns_after_used, w_after, risk_free_annual, bench_ret_spx, bench_ret_dax
+    )
 
-    fig, ax = plt.subplots()
-    cum_equal.plot(ax=ax, label="Equal Weight")
-    cum_opt.plot(ax=ax, label="Optimized")
-    ax.set_title("Kumulierte Performance")
-    ax.set_ylabel("Indexiert (Start = 1.0)")
-    ax.legend()
-    st.pyplot(fig)
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.write("Basis-Portfolio – Gewichte:")
+        st.bar_chart(
+            pd.DataFrame({"Weight_%": w_base * 100}, index=base_universe)
+        )
+
+    with col2:
+        st.write("After-Portfolio – Gewichte:")
+        st.bar_chart(
+            pd.DataFrame({"Weight_%": w_after * 100}, index=after_universe)
+        )
+
+    st.write("Portfolio-Kennzahlen: Basis vs. After")
+
+    compare_df = pd.DataFrame(
+        {
+            "Basis": {
+                "Ann. Return": base_stats["Ann. Return"],
+                "Ann. Vol": base_stats["Ann. Vol"],
+                "Sharpe": base_stats["Sharpe"],
+                "Sortino": base_stats["Sortino"],
+                "Max Drawdown": base_stats["Max Drawdown"],
+                "Hit Ratio": base_stats["Hit Ratio"],
+                "Beta_SPX": base_stats["Beta_SPX"],
+                "Alpha_SPX": base_stats["Alpha_SPX"],
+                "Beta_DAX": base_stats["Beta_DAX"],
+                "Alpha_DAX": base_stats["Alpha_DAX"],
+            },
+            "After": {
+                "Ann. Return": after_stats["Ann. Return"],
+                "Ann. Vol": after_stats["Ann. Vol"],
+                "Sharpe": after_stats["Sharpe"],
+                "Sortino": after_stats["Sortino"],
+                "Max Drawdown": after_stats["Max Drawdown"],
+                "Hit Ratio": after_stats["Hit Ratio"],
+                "Beta_SPX": after_stats["Beta_SPX"],
+                "Alpha_SPX": after_stats["Alpha_SPX"],
+                "Beta_DAX": after_stats["Beta_DAX"],
+                "Alpha_DAX": after_stats["Alpha_DAX"],
+            },
+        }
+    )
+
+    # Formatierung für Anzeige
+    disp_compare = compare_df.copy()
+    for row in ["Ann. Return", "Ann. Vol", "Max Drawdown", "Hit Ratio", "Alpha_SPX", "Alpha_DAX"]:
+        disp_compare.loc[row, :] = disp_compare.loc[row, :].apply(fmt_pct)
+    for row in ["Sharpe", "Sortino", "Beta_SPX", "Beta_DAX"]:
+        disp_compare.loc[row, :] = disp_compare.loc[row, :].apply(fmt_ratio)
+
+    st.dataframe(disp_compare, use_container_width=True)
+
+# ─────────────────────────────────────────────
+# Download der Ticker als CSV (EU-Format)
+# ─────────────────────────────────────────────
+st.subheader("Export: Ticker-Liste als CSV (EU-Format)")
+
+export_universe = sorted(set(all_input_tickers))
+export_df = pd.DataFrame({"Ticker": export_universe})
+
+csv_bytes = export_df.to_csv(
+    sep=";", decimal=",", index=False
+).encode("utf-8")
+
+st.download_button(
+    label="⬇️ Ticker-Liste als CSV speichern",
+    data=csv_bytes,
+    file_name="portfolio_ticker_eu.csv",
+    mime="text/csv"
+)
 
 st.caption(
-    "Alle Kennzahlen rein historisch, keine Garantie für zukünftige Entwicklungen. "
-    "Nur für professionelle/qualifizierte Investoren."
+    "Alle Kennzahlen beruhen auf historischen Daten und stellen keine Garantie für "
+    "zukünftige Entwicklungen dar. Nur für professionelle/qualifizierte Investoren."
 )
